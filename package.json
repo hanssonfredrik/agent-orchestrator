@@ -1,0 +1,13 @@
+{
+  "name": "agent-orchestrator",
+  "version": "1.0.0",
+  "description": "Multi-agent orchestrator using Claude AI for automated software development workflows",
+  "type": "module",
+  "main": "orchestrate.js",
+  "scripts": {
+    "start": "node orchestrate.js",
+    "discover": "node discover.js",
+    "discover:run": "node discover.js --run"
+  },
+  "dependencies": {}
+}
