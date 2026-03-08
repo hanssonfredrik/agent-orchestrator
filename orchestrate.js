@@ -10,6 +10,7 @@
 import { spawn } from "child_process";
 import fs from "fs/promises";
 import path from "path";
+import readline from "readline";
 
 // ---------- Configuration ----------
 
@@ -19,6 +20,27 @@ const MODELS = {
 };
 
 const MAX_REVIEW_ITERATIONS = 3;
+const MAX_RETRIES = 5;
+const RETRY_BASE_DELAY_MS = 10_000; // 10 seconds base, doubles each retry
+
+// ---------- Graceful shutdown ----------
+
+let shuttingDown = false;
+
+process.on("SIGINT", () => {
+  if (shuttingDown) {
+    console.error("\nForce quit.");
+    process.exit(1);
+  }
+  shuttingDown = true;
+  console.error("\nShutting down gracefully... (Ctrl+C again to force quit)");
+});
+
+function checkShutdown() {
+  if (shuttingDown) {
+    throw new Error("SHUTDOWN");
+  }
+}
 
 // ---------- Utilities ----------
 
@@ -54,6 +76,52 @@ function stopSpinner(interval) {
   process.stderr.write("\r\x1b[K");
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    // Allow Ctrl+C to interrupt sleep
+    const check = setInterval(() => {
+      if (shuttingDown) {
+        clearTimeout(timer);
+        clearInterval(check);
+        resolve();
+      }
+    }, 500);
+  });
+}
+
+// ---------- Error detection ----------
+
+const RATE_LIMIT_PATTERNS = [
+  /out of.*usage/i,
+  /rate.?limit/i,
+  /usage.?limit/i,
+  /too many requests/i,
+  /overloaded/i,
+  /capacity/i,
+  /throttl/i,
+  /429/,
+  /try again/i,
+];
+
+function isRateLimitError(errorText) {
+  return RATE_LIMIT_PATTERNS.some((p) => p.test(errorText));
+}
+
+function isTransientError(errorText) {
+  return (
+    isRateLimitError(errorText) ||
+    /timeout/i.test(errorText) ||
+    /ECONNRESET/i.test(errorText) ||
+    /ECONNREFUSED/i.test(errorText) ||
+    /ETIMEDOUT/i.test(errorText) ||
+    /network/i.test(errorText) ||
+    /5\d\d/.test(errorText) ||
+    /internal.*error/i.test(errorText) ||
+    /service.*unavailable/i.test(errorText)
+  );
+}
+
 // ---------- Core agent call ----------
 
 function runClaude({ systemPrompt, userMessage, model }) {
@@ -79,39 +147,97 @@ function runClaude({ systemPrompt, userMessage, model }) {
 
     proc.on("close", (code) => {
       if (code !== 0) {
-        reject(new Error(`claude CLI exited with code ${code}:\n${stderr}`));
+        const errText = stderr || stdout || `exit code ${code}`;
+        const err = new Error(errText);
+        err.isRateLimit = isRateLimitError(errText);
+        err.isTransient = isTransientError(errText);
+        reject(err);
       } else {
         resolve(stdout.trim());
       }
     });
 
-    // Pass everything via stdin to avoid shell escaping issues on Windows
     proc.stdin.write(`<instructions>\n${systemPrompt}\n</instructions>\n\n${userMessage}`);
     proc.stdin.end();
   });
 }
 
-async function runAgent({ name, systemPrompt, userMessage, model, logPath }) {
+async function runAgentWithRetry({ name, systemPrompt, userMessage, model, logPath }) {
   const m = model ?? MODELS.default;
   await log(logPath, `AGENT: ${name} (${m}) — INPUT`, userMessage);
 
-  const spinner = startSpinner(`Running ${name}`);
-  let output;
-  try {
-    output = await runClaude({ systemPrompt, userMessage, model: m });
-  } finally {
-    stopSpinner(spinner);
-  }
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    checkShutdown();
 
-  await log(logPath, `AGENT: ${name} — OUTPUT`, output);
-  return output;
+    const spinner = startSpinner(
+      attempt === 1 ? `Running ${name}` : `Running ${name} (retry ${attempt}/${MAX_RETRIES})`
+    );
+
+    try {
+      const output = await runClaude({ systemPrompt, userMessage, model: m });
+      stopSpinner(spinner);
+      await log(logPath, `AGENT: ${name} — OUTPUT`, output);
+      return output;
+    } catch (err) {
+      stopSpinner(spinner);
+
+      if (err.message === "SHUTDOWN") throw err;
+
+      const isLastAttempt = attempt === MAX_RETRIES;
+
+      if (err.isRateLimit) {
+        const waitSec = Math.min(RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 1), 300_000) / 1000;
+        await log(logPath, `AGENT: ${name} — RATE LIMITED`, `Attempt ${attempt}. Waiting ${waitSec}s...`);
+        console.error(`\n⏳ Rate limited. Waiting ${waitSec}s before retry... (Ctrl+C to cancel)`);
+
+        if (isLastAttempt) {
+          // On last attempt for rate limit, ask user
+          const shouldContinue = await askUserToContinue(
+            `Rate limit hit after ${MAX_RETRIES} retries. Keep waiting? (y/n): `
+          );
+          if (shouldContinue) {
+            attempt--; // retry same attempt number
+            await sleep(waitSec * 1000);
+            continue;
+          }
+          throw new Error(`Rate limited after ${MAX_RETRIES} attempts on agent "${name}".`);
+        }
+
+        await sleep(waitSec * 1000);
+        continue;
+      }
+
+      if (err.isTransient && !isLastAttempt) {
+        const waitSec = Math.min(RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 1), 120_000) / 1000;
+        await log(logPath, `AGENT: ${name} — TRANSIENT ERROR`, `${err.message}\nRetrying in ${waitSec}s...`);
+        console.error(`\n⚠ Transient error on ${name}: ${err.message.slice(0, 200)}`);
+        console.error(`  Retrying in ${waitSec}s... (attempt ${attempt}/${MAX_RETRIES})`);
+        await sleep(waitSec * 1000);
+        continue;
+      }
+
+      // Non-transient or last attempt
+      await log(logPath, `AGENT: ${name} — FAILED`, err.message);
+      throw err;
+    }
+  }
+}
+
+function askUserToContinue(prompt) {
+  return new Promise((resolve) => {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stderr });
+    rl.question(prompt, (answer) => {
+      rl.close();
+      resolve(answer.toLowerCase().startsWith("y"));
+    });
+  });
 }
 
 // ---------- Pipeline steps ----------
 
 async function stepProductDesigner({ task, workDir, logPath }) {
   const systemPrompt = await readPrompt("product-designer");
-  const prd = await runAgent({
+  const prd = await runAgentWithRetry({
     name: "Product Designer",
     systemPrompt,
     userMessage: `Create a Product Requirements Document for this task:\n\n${task}`,
@@ -123,7 +249,7 @@ async function stepProductDesigner({ task, workDir, logPath }) {
 
 async function stepTestWriter({ prd, workDir, logPath }) {
   const systemPrompt = await readPrompt("test-writer");
-  const tests = await runAgent({
+  const tests = await runAgentWithRetry({
     name: "Test Writer",
     systemPrompt,
     userMessage: `Write tests based on this PRD:\n\n${prd}`,
@@ -136,7 +262,7 @@ async function stepTestWriter({ prd, workDir, logPath }) {
 
 async function stepFrontendBuilder({ prd, tests, workDir, logPath }) {
   const systemPrompt = await readPrompt("frontend-builder");
-  const code = await runAgent({
+  const code = await runAgentWithRetry({
     name: "Frontend Builder",
     systemPrompt,
     userMessage: `Build the frontend based on this PRD and these tests.\n\n## PRD\n${prd}\n\n## Tests\n${tests}`,
@@ -148,7 +274,7 @@ async function stepFrontendBuilder({ prd, tests, workDir, logPath }) {
 
 async function stepBackendBuilder({ prd, tests, workDir, logPath }) {
   const systemPrompt = await readPrompt("backend-builder");
-  const code = await runAgent({
+  const code = await runAgentWithRetry({
     name: "Backend Builder",
     systemPrompt,
     userMessage: `Build the backend based on this PRD and these tests.\n\n## PRD\n${prd}\n\n## Tests\n${tests}`,
@@ -168,7 +294,7 @@ async function stepCodeReviewer({
   logPath,
 }) {
   const systemPrompt = await readPrompt("code-reviewer");
-  const review = await runAgent({
+  const review = await runAgentWithRetry({
     name: `Code Reviewer (iteration ${iteration})`,
     systemPrompt,
     userMessage: `Review this code. Reply with SHIP IT if it passes, or detailed feedback if it does not.\n\n## PRD\n${prd}\n\n## Tests\n${tests}\n\n## Frontend Code\n${frontend}\n\n## Backend Code\n${backend}`,
@@ -184,7 +310,7 @@ async function stepCodeReviewer({
 
 async function stepPM({ prd, workDir, logPath }) {
   const systemPrompt = await readPrompt("pm");
-  const summary = await runAgent({
+  const summary = await runAgentWithRetry({
     name: "PM",
     systemPrompt,
     userMessage: `Document the completed sprint based on this PRD:\n\n${prd}`,
@@ -197,7 +323,7 @@ async function stepPM({ prd, workDir, logPath }) {
 
 async function stepGitCommitter({ prd, frontend, backend, workDir, logPath }) {
   const systemPrompt = await readPrompt("git-committer");
-  const commitMsg = await runAgent({
+  const commitMsg = await runAgentWithRetry({
     name: "Git Committer",
     systemPrompt,
     userMessage: `Generate a conventional commit message for the following work.\n\n## PRD\n${prd}\n\n## Frontend Changes\n${frontend}\n\n## Backend Changes\n${backend}`,
@@ -220,6 +346,9 @@ async function orchestrate(task) {
 
   await log(logPath, "ORCHESTRATOR START", `Task: ${task}\nRun ID: ${id}`);
 
+  console.error(`\nWorkspace: ${workDir}`);
+  console.error(`Log: ${logPath}\n`);
+
   // Step 1: PRD
   const prd = await stepProductDesigner({ task, workDir, logPath });
 
@@ -236,6 +365,8 @@ async function orchestrate(task) {
   let currentBackend = backend;
 
   for (let i = 1; i <= MAX_REVIEW_ITERATIONS; i++) {
+    checkShutdown();
+
     const review = await stepCodeReviewer({
       prd,
       tests,
@@ -305,11 +436,16 @@ async function orchestrate(task) {
 
 const task = process.argv.slice(2).join(" ");
 if (!task) {
-  console.error("Usage: node orchestrate.js \"your task description\"");
+  console.error('Usage: node orchestrate.js "your task description"');
   process.exit(1);
 }
 
 orchestrate(task).catch((err) => {
-  console.error("Orchestrator failed:", err);
+  if (err.message === "SHUTDOWN") {
+    console.error("\nOrchestrator stopped by user. Partial results may be in workspace/.");
+    process.exit(0);
+  }
+  console.error(`\nOrchestrator failed: ${err.message}`);
+  console.error("Partial results may be saved in workspace/. Check the log for details.");
   process.exit(1);
 });
