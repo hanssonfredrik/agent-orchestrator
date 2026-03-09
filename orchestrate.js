@@ -7,6 +7,7 @@
  * Usage:
  *   node orchestrate.js                    — interactive spec selector
  *   node orchestrate.js "task description" — direct orchestration
+ *   node orchestrate.js --resume           — resume a previous run from a specific step
  */
 
 import { spawn } from "child_process";
@@ -235,6 +236,68 @@ function askUserToContinue(prompt) {
   });
 }
 
+// ---------- Code extraction ----------
+
+/**
+ * Parse fenced code blocks from builder markdown output and write them as
+ * real files under `projectDir`. Expects blocks with a file path comment on
+ * the first line, e.g.:
+ *   ```js
+ *   // src/server.js
+ *   ...code...
+ *   ```
+ * Returns the number of files written.
+ */
+async function extractCodeFiles(markdown, projectDir, logPath) {
+  // Match fenced code blocks: ```lang\n...content...\n```
+  const codeBlockRegex = /```[a-z]*\n([\s\S]*?)```/g;
+
+  // Patterns to detect a file path on the first line of a code block
+  const filePathPatterns = [
+    /^\/\/\s*(.+\.\w+)\s*$/,        // // src/app.js
+    /^#\s*(.+\.\w+)\s*$/,           // # src/app.py
+    /^<!--\s*(.+\.\w+)\s*-->\s*$/,  // <!-- src/index.html -->
+    /^\/\*\s*(.+\.\w+)\s*\*\/\s*$/, // /* src/styles.css */
+    /^;\s*(.+\.\w+)\s*$/,           // ; config.ini
+  ];
+
+  let filesWritten = 0;
+  let match;
+
+  while ((match = codeBlockRegex.exec(markdown)) !== null) {
+    const content = match[1];
+    const firstLine = content.split("\n")[0].trim();
+
+    let filePath = null;
+    for (const pattern of filePathPatterns) {
+      const m = firstLine.match(pattern);
+      if (m) {
+        filePath = m[1].trim();
+        break;
+      }
+    }
+
+    if (!filePath) continue;
+
+    // Security: prevent path traversal
+    const normalized = path.normalize(filePath);
+    if (normalized.startsWith("..") || path.isAbsolute(normalized)) {
+      await log(logPath, "CODE EXTRACT — SKIPPED", `Suspicious path: ${filePath}`);
+      continue;
+    }
+
+    const fullPath = path.join(projectDir, normalized);
+    await ensureDir(path.dirname(fullPath));
+
+    // Write the code without the file path comment line
+    const codeLines = content.split("\n").slice(1);
+    await fs.writeFile(fullPath, codeLines.join("\n"), "utf-8");
+    filesWritten++;
+  }
+
+  return filesWritten;
+}
+
 // ---------- Pipeline steps ----------
 
 async function stepProductDesigner({ task, workDir, logPath }) {
@@ -249,20 +312,28 @@ async function stepProductDesigner({ task, workDir, logPath }) {
   return prd;
 }
 
-async function stepTestWriter({ prd, workDir, logPath }) {
+async function stepTestWriter({ prd, workDir, projectDir, logPath }) {
   const systemPrompt = await readPrompt("test-writer");
   const tests = await runAgentWithRetry({
     name: "Test Writer",
     systemPrompt,
-    userMessage: `Write tests based on this PRD:\n\n${prd}`,
+    userMessage: `Write executable test files based on this PRD:\n\n${prd}`,
     model: MODELS.fast,
     logPath,
   });
   await fs.writeFile(path.join(workDir, "tests.md"), tests, "utf-8");
+
+  // Extract actual test files
+  const count = await extractCodeFiles(tests, projectDir, logPath);
+  if (count > 0) {
+    await log(logPath, "CODE EXTRACT — TESTS", `Wrote ${count} test file(s) to ${projectDir}`);
+    console.error(`  Extracted ${count} test file(s) to ${projectDir}`);
+  }
+
   return tests;
 }
 
-async function stepFrontendBuilder({ prd, tests, workDir, logPath }) {
+async function stepFrontendBuilder({ prd, tests, workDir, projectDir, logPath }) {
   const systemPrompt = await readPrompt("frontend-builder");
   const code = await runAgentWithRetry({
     name: "Frontend Builder",
@@ -271,10 +342,20 @@ async function stepFrontendBuilder({ prd, tests, workDir, logPath }) {
     logPath,
   });
   await fs.writeFile(path.join(workDir, "frontend.md"), code, "utf-8");
+
+  // Extract actual source files
+  const count = await extractCodeFiles(code, projectDir, logPath);
+  if (count > 0) {
+    await log(logPath, "CODE EXTRACT — FRONTEND", `Wrote ${count} file(s) to ${projectDir}`);
+    console.error(`  Extracted ${count} frontend file(s) to ${projectDir}`);
+  } else {
+    console.error("  ⚠ No code blocks with file paths found in frontend output");
+  }
+
   return code;
 }
 
-async function stepBackendBuilder({ prd, tests, workDir, logPath }) {
+async function stepBackendBuilder({ prd, tests, workDir, projectDir, logPath }) {
   const systemPrompt = await readPrompt("backend-builder");
   const code = await runAgentWithRetry({
     name: "Backend Builder",
@@ -283,6 +364,16 @@ async function stepBackendBuilder({ prd, tests, workDir, logPath }) {
     logPath,
   });
   await fs.writeFile(path.join(workDir, "backend.md"), code, "utf-8");
+
+  // Extract actual source files
+  const count = await extractCodeFiles(code, projectDir, logPath);
+  if (count > 0) {
+    await log(logPath, "CODE EXTRACT — BACKEND", `Wrote ${count} file(s) to ${projectDir}`);
+    console.error(`  Extracted ${count} backend file(s) to ${projectDir}`);
+  } else {
+    console.error("  ⚠ No code blocks with file paths found in backend output");
+  }
+
   return code;
 }
 
@@ -336,102 +427,233 @@ async function stepGitCommitter({ prd, frontend, backend, workDir, logPath }) {
   return commitMsg;
 }
 
+// ---------- Pipeline step definitions ----------
+
+const STEPS = [
+  { name: "prd",      label: "Product Designer", file: "prd.md" },
+  { name: "tests",    label: "Test Writer",      file: "tests.md" },
+  { name: "frontend", label: "Frontend Builder", file: "frontend.md" },
+  { name: "backend",  label: "Backend Builder",  file: "backend.md" },
+  { name: "review",   label: "Code Reviewer",    file: "review-1.md" },
+  { name: "pm",       label: "PM Summary",       file: "sprint-summary.md" },
+  { name: "commit",   label: "Git Committer",    file: "commit-message.md" },
+];
+
 // ---------- Main orchestration loop ----------
 
-async function orchestrate(task) {
-  const id = runId();
-  const workDir = path.join(import.meta.dirname, "workspace", id);
+async function orchestrate(task, { resumeDir, startFrom } = {}) {
+  const id = resumeDir ? path.basename(resumeDir) : runId();
+  const workDir = resumeDir || path.join(import.meta.dirname, "workspace", id);
   const logPath = path.join(import.meta.dirname, "logs", `${id}.log`);
 
+  const projectDir = path.join(workDir, "project");
+
   await ensureDir(workDir);
+  await ensureDir(projectDir);
   await ensureDir(path.join(import.meta.dirname, "logs"));
 
-  await log(logPath, "ORCHESTRATOR START", `Task: ${task}\nRun ID: ${id}`);
+  const startIndex = startFrom
+    ? STEPS.findIndex((s) => s.name === startFrom)
+    : 0;
+
+  // Load existing artifacts from previous run
+  async function loadArtifact(file) {
+    try {
+      return await fs.readFile(path.join(workDir, file), "utf-8");
+    } catch {
+      return null;
+    }
+  }
+
+  if (resumeDir) {
+    await log(logPath, "ORCHESTRATOR RESUMED", `Resuming from step: ${STEPS[startIndex].label}\nRun ID: ${id}`);
+  } else {
+    await log(logPath, "ORCHESTRATOR START", `Task: ${task}\nRun ID: ${id}`);
+  }
 
   console.error(`\nWorkspace: ${workDir}`);
   console.error(`Log: ${logPath}\n`);
 
   // Step 1: PRD
-  const prd = await stepProductDesigner({ task, workDir, logPath });
+  let prd;
+  if (startIndex <= 0) {
+    prd = await stepProductDesigner({ task, workDir, logPath });
+  } else {
+    prd = await loadArtifact("prd.md");
+    if (!prd) throw new Error("Cannot resume: prd.md not found in workspace");
+    console.error("  Loaded existing prd.md");
+  }
 
   // Step 2: Tests
-  const tests = await stepTestWriter({ prd, workDir, logPath });
+  let tests;
+  if (startIndex <= 1) {
+    if (startIndex < 1) {
+      // Already ran PRD above, continue normally
+    }
+    tests = await stepTestWriter({ prd, workDir, projectDir, logPath });
+  } else {
+    tests = await loadArtifact("tests.md");
+    if (!tests) throw new Error("Cannot resume: tests.md not found in workspace");
+    console.error("  Loaded existing tests.md");
+  }
 
-  // Step 3: Build (frontend + backend in sequence to keep logs readable)
-  const frontend = await stepFrontendBuilder({ prd, tests, workDir, logPath });
-  const backend = await stepBackendBuilder({ prd, tests, workDir, logPath });
+  // Step 3: Build
+  let frontend, backend;
+  if (startIndex <= 2) {
+    frontend = await stepFrontendBuilder({ prd, tests, workDir, projectDir, logPath });
+  } else {
+    frontend = await loadArtifact("frontend.md");
+    if (!frontend) throw new Error("Cannot resume: frontend.md not found in workspace");
+    console.error("  Loaded existing frontend.md");
+  }
+
+  if (startIndex <= 3) {
+    if (startIndex > 2) {
+      // Resuming from backend specifically — frontend was loaded above
+    }
+    backend = await stepBackendBuilder({ prd, tests, workDir, projectDir, logPath });
+  } else {
+    backend = await loadArtifact("backend.md");
+    if (!backend) throw new Error("Cannot resume: backend.md not found in workspace");
+    console.error("  Loaded existing backend.md");
+  }
 
   // Step 4: Review loop
   let approved = false;
   let currentFrontend = frontend;
   let currentBackend = backend;
 
-  for (let i = 1; i <= MAX_REVIEW_ITERATIONS; i++) {
-    checkShutdown();
+  if (startIndex <= 4) {
+    for (let i = 1; i <= MAX_REVIEW_ITERATIONS; i++) {
+      checkShutdown();
 
-    const review = await stepCodeReviewer({
+      const review = await stepCodeReviewer({
+        prd,
+        tests,
+        frontend: currentFrontend,
+        backend: currentBackend,
+        iteration: i,
+        workDir,
+        logPath,
+      });
+
+      if (review.includes("SHIP IT")) {
+        await log(logPath, "REVIEW APPROVED", `Approved on iteration ${i}`);
+        approved = true;
+        break;
+      }
+
+      if (i < MAX_REVIEW_ITERATIONS) {
+        await log(
+          logPath,
+          "REVIEW REJECTED",
+          `Iteration ${i} — rebuilding with feedback`
+        );
+        currentFrontend = await stepFrontendBuilder({
+          prd,
+          tests: `${tests}\n\n## Reviewer Feedback\n${review}`,
+          workDir,
+          projectDir,
+          logPath,
+        });
+        currentBackend = await stepBackendBuilder({
+          prd,
+          tests: `${tests}\n\n## Reviewer Feedback\n${review}`,
+          workDir,
+          projectDir,
+          logPath,
+        });
+      } else {
+        await log(
+          logPath,
+          "REVIEW MAX ITERATIONS REACHED",
+          "Proceeding despite review failures — manual intervention needed."
+        );
+      }
+    }
+  }
+
+  // Step 5: Install dependencies and validate
+  checkShutdown();
+  const packageJsonPath = path.join(projectDir, "package.json");
+  try {
+    await fs.access(packageJsonPath);
+    console.error("\n  Installing dependencies...");
+    const installResult = await new Promise((resolve) => {
+      const proc = spawn("npm", ["install"], {
+        cwd: projectDir,
+        shell: true,
+        windowsHide: true,
+      });
+      let out = "";
+      let err = "";
+      proc.stdout.on("data", (d) => { out += d; });
+      proc.stderr.on("data", (d) => { err += d; });
+      proc.on("close", (code) => resolve({ code, out, err }));
+    });
+
+    if (installResult.code === 0) {
+      await log(logPath, "NPM INSTALL", "Dependencies installed successfully.");
+      console.error("  Dependencies installed successfully.");
+    } else {
+      await log(logPath, "NPM INSTALL — FAILED", installResult.err || installResult.out);
+      console.error(`  ⚠ npm install failed (exit ${installResult.code}). Check the log for details.`);
+    }
+  } catch {
+    await log(logPath, "NPM INSTALL — SKIPPED", "No package.json found in project directory.");
+    console.error("  ⚠ No package.json found — the backend builder may not have produced one.");
+  }
+
+  // Step 6: PM summary
+  if (startIndex <= 5) {
+    await stepPM({ prd, workDir, logPath });
+  }
+
+  // Step 7: Commit message
+  if (startIndex <= 6) {
+    const commitMsg = await stepGitCommitter({
       prd,
-      tests,
       frontend: currentFrontend,
       backend: currentBackend,
-      iteration: i,
       workDir,
       logPath,
     });
 
-    if (review.includes("SHIP IT")) {
-      await log(logPath, "REVIEW APPROVED", `Approved on iteration ${i}`);
-      approved = true;
-      break;
-    }
-
-    if (i < MAX_REVIEW_ITERATIONS) {
-      await log(
-        logPath,
-        "REVIEW REJECTED",
-        `Iteration ${i} — rebuilding with feedback`
-      );
-      currentFrontend = await stepFrontendBuilder({
-        prd,
-        tests: `${tests}\n\n## Reviewer Feedback\n${review}`,
-        workDir,
-        logPath,
-      });
-      currentBackend = await stepBackendBuilder({
-        prd,
-        tests: `${tests}\n\n## Reviewer Feedback\n${review}`,
-        workDir,
-        logPath,
-      });
-    } else {
-      await log(
-        logPath,
-        "REVIEW MAX ITERATIONS REACHED",
-        "Proceeding despite review failures — manual intervention needed."
-      );
-    }
+    await log(
+      logPath,
+      "ORCHESTRATOR COMPLETE",
+      `Run ID: ${id}\nWorkspace: ${workDir}\nApproved: ${approved}\n\nCommit message:\n${commitMsg}`
+    );
   }
 
-  // Step 5: PM summary
-  await stepPM({ prd, workDir, logPath });
+  // Summary
+  let fileCount = 0;
+  try {
+    const listFiles = async (dir) => {
+      const entries = await fs.readdir(dir, { withFileTypes: true });
+      let count = 0;
+      for (const e of entries) {
+        if (e.name === "node_modules") continue;
+        if (e.isDirectory()) count += await listFiles(path.join(dir, e.name));
+        else count++;
+      }
+      return count;
+    };
+    fileCount = await listFiles(projectDir);
+  } catch {}
 
-  // Step 6: Commit message
-  const commitMsg = await stepGitCommitter({
-    prd,
-    frontend: currentFrontend,
-    backend: currentBackend,
-    workDir,
-    logPath,
-  });
-
-  await log(
-    logPath,
-    "ORCHESTRATOR COMPLETE",
-    `Run ID: ${id}\nWorkspace: ${workDir}\nApproved: ${approved}\n\nCommit message:\n${commitMsg}`
-  );
-
-  console.log(`\nDone. Outputs written to: ${workDir}`);
-  console.log(`Full log: ${logPath}`);
+  console.log(`\n${"=".repeat(50)}`);
+  console.log(`  Project ready! (${fileCount} files)`);
+  console.log(`${"=".repeat(50)}`);
+  console.log(`\n  Project:   ${projectDir}`);
+  console.log(`  Workspace: ${workDir}`);
+  console.log(`  Log:       ${logPath}`);
+  console.log(`\n  To run:`);
+  console.log(`    cd ${projectDir}`);
+  console.log(`    npm start`);
+  console.log(`\n  To test:`);
+  console.log(`    cd ${projectDir}`);
+  console.log(`    npm test`);
 }
 
 // ---------- Interactive spec selector ----------
@@ -499,18 +721,151 @@ async function interactiveSelect() {
   return task.trim();
 }
 
+// ---------- Resume picker ----------
+
+async function findRuns() {
+  const workspaceDir = path.join(import.meta.dirname, "workspace");
+  try {
+    const entries = await fs.readdir(workspaceDir);
+    const runs = [];
+    for (const entry of entries.sort().reverse()) {
+      const dir = path.join(workspaceDir, entry);
+      const artifacts = [];
+      for (const step of STEPS) {
+        try {
+          await fs.access(path.join(dir, step.file));
+          artifacts.push(step.name);
+        } catch {
+          // artifact doesn't exist
+        }
+      }
+      // Also check for spec.md (from discover.js)
+      let hasSpec = false;
+      try {
+        await fs.access(path.join(dir, "spec.md"));
+        hasSpec = true;
+      } catch {}
+      if (artifacts.length > 0 || hasSpec) {
+        runs.push({ id: entry, dir, artifacts, hasSpec });
+      }
+    }
+    return runs;
+  } catch {
+    return [];
+  }
+}
+
+function detectNextStep(artifacts) {
+  for (const step of STEPS) {
+    if (!artifacts.includes(step.name)) return step;
+  }
+  return null; // all steps complete
+}
+
+async function interactiveResume() {
+  const runs = await findRuns();
+  const rl = readline.createInterface({ input: process.stdin, output: process.stderr });
+  const question = (q) => new Promise((resolve) => rl.question(q, resolve));
+
+  console.error("\n╔══════════════════════════════════════╗");
+  console.error("║     Resume Previous Run              ║");
+  console.error("╚══════════════════════════════════════╝\n");
+
+  if (runs.length === 0) {
+    console.error("No previous runs found.");
+    rl.close();
+    process.exit(1);
+  }
+
+  console.error("Previous runs:\n");
+  for (let i = 0; i < runs.length; i++) {
+    const run = runs[i];
+    const completed = run.artifacts.map((a) => {
+      const step = STEPS.find((s) => s.name === a);
+      return step ? step.label : a;
+    });
+    const next = detectNextStep(run.artifacts);
+    const status = next ? `next: ${next.label}` : "all steps complete";
+    console.error(`  ${i + 1}) [${run.id}]`);
+    console.error(`     Completed: ${completed.join(", ") || "none"}`);
+    console.error(`     Status: ${status}\n`);
+  }
+
+  const runAnswer = await question("Select a run (number): ");
+  const runChoice = parseInt(runAnswer.trim(), 10);
+
+  if (runChoice < 1 || runChoice > runs.length) {
+    console.error("Invalid selection. Exiting.");
+    rl.close();
+    process.exit(1);
+  }
+
+  const selectedRun = runs[runChoice - 1];
+  const nextStep = detectNextStep(selectedRun.artifacts);
+
+  console.error("\nResume from which step?\n");
+  for (let i = 0; i < STEPS.length; i++) {
+    const step = STEPS[i];
+    const has = selectedRun.artifacts.includes(step.name);
+    const marker = step === nextStep ? " <-- suggested" : "";
+    console.error(`  ${i + 1}) ${step.label} ${has ? "(done)" : "(pending)"}${marker}`);
+  }
+
+  const defaultStep = nextStep ? STEPS.indexOf(nextStep) + 1 : 1;
+  const stepAnswer = await question(`\nStart from step (default ${defaultStep}): `);
+  const stepChoice = parseInt(stepAnswer.trim(), 10) || defaultStep;
+
+  rl.close();
+
+  if (stepChoice < 1 || stepChoice > STEPS.length) {
+    console.error("Invalid step. Exiting.");
+    process.exit(1);
+  }
+
+  const startFrom = STEPS[stepChoice - 1].name;
+
+  // Load task from spec.md or prd.md
+  let task;
+  try {
+    task = await fs.readFile(path.join(selectedRun.dir, "spec.md"), "utf-8");
+  } catch {
+    try {
+      task = await fs.readFile(path.join(selectedRun.dir, "prd.md"), "utf-8");
+    } catch {
+      console.error("Warning: No spec.md or prd.md found — task context may be missing.");
+      task = "(resumed run — original task not available)";
+    }
+  }
+
+  return { task, resumeDir: selectedRun.dir, startFrom };
+}
+
 // ---------- Entry point ----------
 
-const cliTask = process.argv.slice(2).join(" ");
+const isResume = process.argv.includes("--resume");
+const cliTask = isResume ? null : process.argv.slice(2).join(" ");
 
-const task = cliTask || await interactiveSelect();
+if (isResume) {
+  interactiveResume().then(({ task, resumeDir, startFrom }) =>
+    orchestrate(task, { resumeDir, startFrom })
+  ).catch((err) => {
+    if (err.message === "SHUTDOWN") {
+      console.error("\nOrchestrator stopped by user. Partial results may be in workspace/.");
+      process.exit(0);
+    }
+    console.error(`\nOrchestrator failed: ${err.message}`);
+    process.exit(1);
+  });
+} else {
+  const task = cliTask || await interactiveSelect();
 
-orchestrate(task).catch((err) => {
-  if (err.message === "SHUTDOWN") {
-    console.error("\nOrchestrator stopped by user. Partial results may be in workspace/.");
-    process.exit(0);
-  }
-  console.error(`\nOrchestrator failed: ${err.message}`);
-  console.error("Partial results may be saved in workspace/. Check the log for details.");
-  process.exit(1);
-});
+  orchestrate(task).catch((err) => {
+    if (err.message === "SHUTDOWN") {
+      console.error("\nOrchestrator stopped by user. Partial results may be in workspace/.");
+      process.exit(0);
+    }
+    console.error(`\nOrchestrator failed: ${err.message}`);
+    console.error("Partial results may be saved in workspace/. Check the log for details.");
+    process.exit(1);
+  });
+}
