@@ -4,7 +4,9 @@
  * Runs a sequential pipeline of specialized Claude agents, each with
  * isolated context, to take a task from idea to committed code.
  *
- * Usage: node orchestrate.js "your task description"
+ * Usage:
+ *   node orchestrate.js                    — interactive spec selector
+ *   node orchestrate.js "task description" — direct orchestration
  */
 
 import { spawn } from "child_process";
@@ -432,13 +434,76 @@ async function orchestrate(task) {
   console.log(`Full log: ${logPath}`);
 }
 
+// ---------- Interactive spec selector ----------
+
+async function findSpecs() {
+  const workspaceDir = path.join(import.meta.dirname, "workspace");
+  try {
+    const entries = await fs.readdir(workspaceDir);
+    const specs = [];
+    for (const entry of entries.sort().reverse()) {
+      const specPath = path.join(workspaceDir, entry, "spec.md");
+      try {
+        const content = await fs.readFile(specPath, "utf-8");
+        const firstLine = content.split("\n").find((l) => l.trim()) || "(empty spec)";
+        specs.push({ id: entry, path: specPath, preview: firstLine.slice(0, 80), content });
+      } catch {
+        // no spec.md in this directory, skip
+      }
+    }
+    return specs;
+  } catch {
+    return [];
+  }
+}
+
+async function interactiveSelect() {
+  const specs = await findSpecs();
+  const rl = readline.createInterface({ input: process.stdin, output: process.stderr });
+  const question = (q) => new Promise((resolve) => rl.question(q, resolve));
+
+  console.error("\n╔══════════════════════════════════════╗");
+  console.error("║        Agent Orchestrator            ║");
+  console.error("╚══════════════════════════════════════╝\n");
+
+  if (specs.length > 0) {
+    console.error("Available specs:\n");
+    for (let i = 0; i < specs.length; i++) {
+      console.error(`  ${i + 1}) [${specs[i].id}]`);
+      console.error(`     ${specs[i].preview}`);
+    }
+    console.error(`\n  0) Enter a new task description\n`);
+
+    const answer = await question("Select a spec (number): ");
+    const choice = parseInt(answer.trim(), 10);
+
+    if (choice >= 1 && choice <= specs.length) {
+      rl.close();
+      return specs[choice - 1].content;
+    }
+
+    if (choice !== 0 && answer.trim() !== "") {
+      console.error("Invalid selection, entering new task mode.\n");
+    }
+  } else {
+    console.error("No saved specs found in workspace/.\n");
+  }
+
+  const task = await question("Enter task description: ");
+  rl.close();
+
+  if (!task.trim()) {
+    console.error("No task provided. Exiting.");
+    process.exit(1);
+  }
+  return task.trim();
+}
+
 // ---------- Entry point ----------
 
-const task = process.argv.slice(2).join(" ");
-if (!task) {
-  console.error('Usage: node orchestrate.js "your task description"');
-  process.exit(1);
-}
+const cliTask = process.argv.slice(2).join(" ");
+
+const task = cliTask || await interactiveSelect();
 
 orchestrate(task).catch((err) => {
   if (err.message === "SHUTDOWN") {
